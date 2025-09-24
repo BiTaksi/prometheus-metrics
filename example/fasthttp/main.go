@@ -48,7 +48,7 @@ func main() {
 		start := time.Now()
 
 		// Mark service as up when it starts
-		m.ServiceUp.Set(1)
+		m.SetServiceUp()
 
 		// Process the request
 		handler(ctx)
@@ -60,8 +60,8 @@ func main() {
 		duration := time.Since(start).Seconds()
 
 		// Update metrics
-		m.ProcessedOpsTotal.WithLabelValues(method, endpoint, statusCode).Inc()
-		m.RequestDuration.WithLabelValues(method, endpoint, statusCode).Observe(duration)
+		m.IncreaseProcessedOps(method, endpoint, statusCode)
+		m.ObserveRequestDuration(method, endpoint, statusCode, duration)
 
 		// Increment failed operations metric on error
 		if ctx.Response.StatusCode() >= 400 {
@@ -69,7 +69,7 @@ func main() {
 			if ctx.Response.StatusCode() >= 500 {
 				errorType = "server_error"
 			}
-			m.FailedOpsTotal.WithLabelValues(method, endpoint, errorType).Inc()
+			m.IncreaseFailedOps(method, endpoint, errorType)
 		}
 	}
 
