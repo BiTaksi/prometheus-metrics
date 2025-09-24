@@ -14,6 +14,9 @@ import (
 type MetricsConfig struct {
 	Namespace string
 	Subsystem string
+	// Normalize is an optional function to transform the request into a low-cardinality endpoint label
+	// If nil, it defaults to returning r.URL.Path as-is
+	Normalize EndpointNormalizer
 }
 
 // DefaultConfig returns a default metrics configuration
@@ -25,34 +28,49 @@ func DefaultConfig() *MetricsConfig {
 }
 
 // Metrics holds all prometheus metrics
-type Metrics struct {
+type IMetrics interface {
+	IBaseMetrics
+	HTTPMiddleware(next http.Handler) http.Handler
+	SetServiceUp()
+	SetServiceDown()
+	UpdateSystemMetrics()
+	RecordGCDuration(duration time.Duration)
+	IncreaseProcessedOps(method, endpoint, statusCode string)
+	IncreaseFailedOps(method, endpoint, errorType string)
+	ObserveRequestDuration(method, endpoint, statusCode string, duration float64)
+}
+
+// EndpointNormalizer transforms a request to a normalized, low-cardinality endpoint label
+type EndpointNormalizer func(r *http.Request) string
+
+type metrics struct {
+	IBaseMetrics
 	// HTTP request metrics
-	ProcessedOpsTotal *prometheus.CounterVec
-	FailedOpsTotal    *prometheus.CounterVec
-	RequestDuration   *prometheus.HistogramVec
+	processedOpsTotal *prometheus.CounterVec
+	failedOpsTotal    *prometheus.CounterVec
+	requestDuration   *prometheus.HistogramVec
 
 	// Service health status metric
-	ServiceUp prometheus.Gauge
+	serviceUp prometheus.Gauge
 
 	// System resource metrics
-	MemoryUsageBytes prometheus.Gauge
-	GoroutinesCount  prometheus.Gauge
-	GCDuration       prometheus.Histogram
+	memoryUsageBytes prometheus.Gauge
+	goroutinesCount  prometheus.Gauge
+	gcDuration       prometheus.Histogram
 
-	// Business metrics - extensible counters and gauges
-	BusinessCounters   map[string]*prometheus.CounterVec
-	BusinessGauges     map[string]*prometheus.GaugeVec
-	BusinessHistograms map[string]*prometheus.HistogramVec
+	// endpoint normalizer
+	normalize EndpointNormalizer
 }
 
 // NewMetrics creates a new Metrics instance with the given configuration
-func NewMetrics(config *MetricsConfig) *Metrics {
+func NewMetrics(config *MetricsConfig) IMetrics {
 	if config == nil {
 		config = DefaultConfig()
 	}
 
-	return &Metrics{
-		ProcessedOpsTotal: promauto.NewCounterVec(
+	m := &metrics{
+		IBaseMetrics: initializeBaseMetrics(),
+		processedOpsTotal: promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -62,7 +80,7 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 			[]string{"method", "endpoint", "status_code"},
 		),
 
-		FailedOpsTotal: promauto.NewCounterVec(
+		failedOpsTotal: promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -72,7 +90,7 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 			[]string{"method", "endpoint", "error_type"},
 		),
 
-		RequestDuration: promauto.NewHistogramVec(
+		requestDuration: promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -83,7 +101,7 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 			[]string{"method", "endpoint", "status_code"},
 		),
 
-		ServiceUp: promauto.NewGauge(
+		serviceUp: promauto.NewGauge(
 			prometheus.GaugeOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -92,7 +110,7 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 			},
 		),
 
-		MemoryUsageBytes: promauto.NewGauge(
+		memoryUsageBytes: promauto.NewGauge(
 			prometheus.GaugeOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -101,7 +119,7 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 			},
 		),
 
-		GoroutinesCount: promauto.NewGauge(
+		goroutinesCount: promauto.NewGauge(
 			prometheus.GaugeOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -110,7 +128,7 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 			},
 		),
 
-		GCDuration: promauto.NewHistogram(
+		gcDuration: promauto.NewHistogram(
 			prometheus.HistogramOpts{
 				Namespace: config.Namespace,
 				Subsystem: config.Subsystem,
@@ -119,18 +137,22 @@ func NewMetrics(config *MetricsConfig) *Metrics {
 				Buckets:   prometheus.DefBuckets,
 			},
 		),
-
-		// Initialize business metrics maps
-		BusinessCounters:   make(map[string]*prometheus.CounterVec),
-		BusinessGauges:     make(map[string]*prometheus.GaugeVec),
-		BusinessHistograms: make(map[string]*prometheus.HistogramVec),
 	}
+
+	// set normalizer
+	if config.Normalize != nil {
+		m.normalize = config.Normalize
+	} else {
+		m.normalize = defaultEndpointNormalize
+	}
+
+	return m
 }
 
 // HTTPMiddleware returns a standard HTTP middleware function for Prometheus metrics
-func (m *Metrics) HTTPMiddleware(next http.Handler) http.Handler {
+func (m *metrics) HTTPMiddleware(next http.Handler) http.Handler {
 	// Mark service as up when it starts
-	m.ServiceUp.Set(1)
+	m.serviceUp.Set(1)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -138,27 +160,37 @@ func (m *Metrics) HTTPMiddleware(next http.Handler) http.Handler {
 		// Create a response recorder to capture status code
 		recorder := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 
+		// Ensure metrics are recorded even if the handler panics
+		defer func() {
+			if rec := recover(); rec != nil {
+				// Best-effort set 500 if nothing meaningful has been written yet
+				if recorder.statusCode < 400 {
+					recorder.WriteHeader(http.StatusInternalServerError)
+				}
+			}
+
+			// Collect metric information
+			method := r.Method
+			endpoint := m.normalize(r)
+			statusCode := strconv.Itoa(recorder.statusCode)
+			duration := time.Since(start).Seconds()
+
+			// Update metrics
+			m.processedOpsTotal.WithLabelValues(method, endpoint, statusCode).Inc()
+			m.requestDuration.WithLabelValues(method, endpoint, statusCode).Observe(duration)
+
+			// Increment failed operations metric on error
+			if recorder.statusCode >= 400 {
+				errorType := "client_error"
+				if recorder.statusCode >= 500 {
+					errorType = "server_error"
+				}
+				m.failedOpsTotal.WithLabelValues(method, endpoint, errorType).Inc()
+			}
+		}()
+
 		// Process the request
 		next.ServeHTTP(recorder, r)
-
-		// Collect metric information
-		method := r.Method
-		endpoint := r.URL.Path
-		statusCode := strconv.Itoa(recorder.statusCode)
-		duration := time.Since(start).Seconds()
-
-		// Update metrics
-		m.ProcessedOpsTotal.WithLabelValues(method, endpoint, statusCode).Inc()
-		m.RequestDuration.WithLabelValues(method, endpoint, statusCode).Observe(duration)
-
-		// Increment failed operations metric on error
-		if recorder.statusCode >= 400 {
-			errorType := "client_error"
-			if recorder.statusCode >= 500 {
-				errorType = "server_error"
-			}
-			m.FailedOpsTotal.WithLabelValues(method, endpoint, errorType).Inc()
-		}
 	})
 }
 
@@ -173,107 +205,45 @@ func (r *responseRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+func (m *metrics) SetServiceUp() {
+	m.serviceUp.Set(1)
+}
+
 // SetServiceDown marks service as down when shutting down
-func (m *Metrics) SetServiceDown() {
-	m.ServiceUp.Set(0)
+func (m *metrics) SetServiceDown() {
+	m.serviceUp.Set(0)
 }
 
 // UpdateSystemMetrics updates system resource metrics
-func (m *Metrics) UpdateSystemMetrics() {
+func (m *metrics) UpdateSystemMetrics() {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
 	// Update memory usage
-	m.MemoryUsageBytes.Set(float64(memStats.Alloc))
+	m.memoryUsageBytes.Set(float64(memStats.Alloc))
 
 	// Update goroutine count
-	m.GoroutinesCount.Set(float64(runtime.NumGoroutine()))
+	m.goroutinesCount.Set(float64(runtime.NumGoroutine()))
 }
 
 // RecordGCDuration records garbage collection duration
-func (m *Metrics) RecordGCDuration(duration time.Duration) {
-	m.GCDuration.Observe(duration.Seconds())
+func (m *metrics) RecordGCDuration(duration time.Duration) {
+	m.gcDuration.Observe(duration.Seconds())
 }
 
-// AddBusinessCounter creates a new business counter metric
-func (m *Metrics) AddBusinessCounter(name, help string, labels []string) *prometheus.CounterVec {
-	counter := promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: name,
-			Help: help,
-		},
-		labels,
-	)
-	m.BusinessCounters[name] = counter
-	return counter
+func (m *metrics) IncreaseProcessedOps(method, endpoint, statusCode string) {
+	m.processedOpsTotal.WithLabelValues(method, endpoint, statusCode).Inc()
 }
 
-// AddBusinessGauge creates a new business gauge metric
-func (m *Metrics) AddBusinessGauge(name, help string, labels []string) *prometheus.GaugeVec {
-	gauge := promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: name,
-			Help: help,
-		},
-		labels,
-	)
-	m.BusinessGauges[name] = gauge
-	return gauge
+func (m *metrics) IncreaseFailedOps(method, endpoint, errorType string) {
+	m.failedOpsTotal.WithLabelValues(method, endpoint, errorType).Inc()
 }
 
-// AddBusinessHistogram creates a new business histogram metric
-func (m *Metrics) AddBusinessHistogram(name, help string, labels []string, buckets []float64) *prometheus.HistogramVec {
-	if buckets == nil {
-		buckets = prometheus.DefBuckets
-	}
-
-	histogram := promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    name,
-			Help:    help,
-			Buckets: buckets,
-		},
-		labels,
-	)
-	m.BusinessHistograms[name] = histogram
-	return histogram
+func (m *metrics) ObserveRequestDuration(method, endpoint, statusCode string, duration float64) {
+	m.requestDuration.WithLabelValues(method, endpoint, statusCode).Observe(duration)
 }
 
-// GetBusinessCounter returns a business counter by name
-func (m *Metrics) GetBusinessCounter(name string) (*prometheus.CounterVec, bool) {
-	counter, exists := m.BusinessCounters[name]
-	return counter, exists
-}
-
-// GetBusinessGauge returns a business gauge by name
-func (m *Metrics) GetBusinessGauge(name string) (*prometheus.GaugeVec, bool) {
-	gauge, exists := m.BusinessGauges[name]
-	return gauge, exists
-}
-
-// GetBusinessHistogram returns a business histogram by name
-func (m *Metrics) GetBusinessHistogram(name string) (*prometheus.HistogramVec, bool) {
-	histogram, exists := m.BusinessHistograms[name]
-	return histogram, exists
-}
-
-// IncrementBusinessCounter increments a business counter
-func (m *Metrics) IncrementBusinessCounter(name string, labelValues ...string) {
-	if counter, exists := m.BusinessCounters[name]; exists {
-		counter.WithLabelValues(labelValues...).Inc()
-	}
-}
-
-// SetBusinessGauge sets a business gauge value
-func (m *Metrics) SetBusinessGauge(name string, value float64, labelValues ...string) {
-	if gauge, exists := m.BusinessGauges[name]; exists {
-		gauge.WithLabelValues(labelValues...).Set(value)
-	}
-}
-
-// ObserveBusinessHistogram observes a value in business histogram
-func (m *Metrics) ObserveBusinessHistogram(name string, value float64, labelValues ...string) {
-	if histogram, exists := m.BusinessHistograms[name]; exists {
-		histogram.WithLabelValues(labelValues...).Observe(value)
-	}
+// defaultEndpointNormalize is the default normalizer that returns the raw path
+func defaultEndpointNormalize(r *http.Request) string {
+	return r.URL.Path
 }
